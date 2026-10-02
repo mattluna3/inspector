@@ -13,17 +13,16 @@ import requests
 
 CMC_API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
 
-TOP_N = 100
+TOP_N = 200   # 1 sola llamada, 1 crédito
 
 DATA_DIR = Path("data") / "cmc"
-CSV_FILE = DATA_DIR / "market_history.csv"
+CSV_FILE = DATA_DIR / "market_history_top100.csv"       # top 1-100
+CSV_EMERGING = DATA_DIR / "market_history_emerging.csv" # top 101-200
 ROTATION_FILE = DATA_DIR / "last_rotation.txt"
 ARCHIVE_DIR = DATA_DIR / "archives"
 
-# Días entre rotaciones
 DIAS_ROTACION = 5
 
-# Repo (para construir URL de descarga)
 GITHUB_USER = "mattluna3"
 GITHUB_REPO = "inspector"
 GITHUB_BRANCH = "main"
@@ -39,7 +38,7 @@ def enviar_telegram(msg):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        print("Telegram no configurado (falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID)")
+        print("Telegram no configurado")
         return False
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -59,8 +58,7 @@ def leer_ultima_rotacion():
     if not ROTATION_FILE.exists():
         return None
     try:
-        contenido = ROTATION_FILE.read_text().strip()
-        return datetime.fromisoformat(contenido)
+        return datetime.fromisoformat(ROTATION_FILE.read_text().strip())
     except Exception:
         return None
 
@@ -71,10 +69,8 @@ def guardar_ultima_rotacion(dt):
 
 
 def inicializar_rotacion():
-    """Crea el archivo de rotación la primera vez que corre."""
     if not ROTATION_FILE.exists():
-        ahora = datetime.now(timezone.utc)
-        guardar_ultima_rotacion(ahora)
+        guardar_ultima_rotacion(datetime.now(timezone.utc))
         print(f"Primera ejecución: próxima rotación en {DIAS_ROTACION} días")
         return True
     return False
@@ -87,62 +83,62 @@ def toca_rotar():
     ahora = datetime.now(timezone.utc)
     if ultima.tzinfo is None:
         ultima = ultima.replace(tzinfo=timezone.utc)
-    delta = ahora - ultima
-    return delta >= timedelta(days=DIAS_ROTACION)
+    return (ahora - ultima) >= timedelta(days=DIAS_ROTACION)
 
 
-def rotar_csv():
-    if not CSV_FILE.exists():
-        print("No hay CSV para rotar.")
+def rotar_ambos_csv():
+    """Rota los 2 CSVs nuevos. NO toca market_history.csv viejo."""
+    if not CSV_FILE.exists() and not CSV_EMERGING.exists():
+        print("No hay CSVs nuevos para rotar.")
         return None
 
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     ahora = datetime.now(timezone.utc)
-    nombre = f"market_history_{ahora.strftime('%Y%m%d_%H%M')}.csv"
-    destino = ARCHIVE_DIR / nombre
+    sufijo = ahora.strftime("%Y%m%d_%H%M")
 
-    CSV_FILE.rename(destino)
-    print(f"CSV rotado a: {destino}")
+    info = {"fecha": ahora, "archivos": [], "tamaño_total_mb": 0}
+
+    if CSV_FILE.exists():
+        destino = ARCHIVE_DIR / f"top100_{sufijo}.csv"
+        CSV_FILE.rename(destino)
+        t = destino.stat().st_size / (1024 * 1024)
+        info["archivos"].append({"nombre": destino.name, "tipo": "top100", "tamaño_mb": t})
+        info["tamaño_total_mb"] += t
+        print(f"Rotado top100: {destino.name} ({t:.2f} MB)")
+
+    if CSV_EMERGING.exists():
+        destino = ARCHIVE_DIR / f"emerging_{sufijo}.csv"
+        CSV_EMERGING.rename(destino)
+        t = destino.stat().st_size / (1024 * 1024)
+        info["archivos"].append({"nombre": destino.name, "tipo": "emerging", "tamaño_mb": t})
+        info["tamaño_total_mb"] += t
+        print(f"Rotado emerging: {destino.name} ({t:.2f} MB)")
 
     guardar_ultima_rotacion(ahora)
-
-    tamaño_mb = destino.stat().st_size / (1024 * 1024)
-
-    return {
-        "ruta": str(destino),
-        "nombre": nombre,
-        "tamaño_mb": tamaño_mb,
-        "fecha": ahora,
-    }
+    return info
 
 
 def notificar_rotacion(info):
-    """Envía Telegram con el enlace de descarga."""
     if not info:
         return
 
-    url_raw = (
-        f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/"
-        f"{GITHUB_BRANCH}/data/cmc/archives/{info['nombre']}"
-    )
-    url_web = (
-        f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}/blob/"
-        f"{GITHUB_BRANCH}/data/cmc/archives/{info['nombre']}"
-    )
-
     fecha_lima = info["fecha"] - timedelta(hours=5)
+    lineas = []
+    for a in info["archivos"]:
+        url_raw = (
+            f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/"
+            f"{GITHUB_BRANCH}/data/cmc/archives/{a['nombre']}"
+        )
+        lineas.append(f"📄 {a['tipo'].upper()} ({a['tamaño_mb']:.1f} MB)\n{a['nombre']}\n{url_raw}")
 
     msg = (
         f"📦 CMC CACHE LISTO PARA DESCARGAR\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📅 Cierre: {fecha_lima.strftime('%Y-%m-%d %H:%M')} Lima\n"
-        f"📄 Archivo: {info['nombre']}\n"
-        f"💾 Tamaño: {info['tamaño_mb']:.2f} MB\n"
+        f"💾 Total: {info['tamaño_total_mb']:.2f} MB\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 Descarga directa:\n"
-        f"{url_raw}\n"
-        f"🌐 Ver en GitHub:\n"
-        f"{url_web}"
+        + "\n\n".join(lineas) +
+        f"\n━━━━━━━━━━━━━━━━━━━"
     )
 
     if enviar_telegram(msg):
@@ -152,39 +148,18 @@ def notificar_rotacion(info):
 
 
 # ============================================================
-# COLUMNAS DEL HISTÓRICO
+# COLUMNAS
 # ============================================================
 
 CSV_COLUMNS = [
-    "snapshot_id",
-    "timestamp",
-
-    "cmc_id",
-    "name",
-    "symbol",
-    "slug",
-
-    "cmc_rank",
-
-    "price",
-
-    "percent_change_1h",
-    "percent_change_24h",
-    "percent_change_7d",
-    "percent_change_30d",
-    "percent_change_60d",
-    "percent_change_90d",
-
-    "volume_24h",
-    "volume_change_24h",
-
-    "market_cap",
-    "market_cap_dominance",
-
-    "volume_rank_top100",
-    "loser_rank_top100",
-    "gainer_rank_top100",
-
+    "snapshot_id", "timestamp",
+    "cmc_id", "name", "symbol", "slug",
+    "cmc_rank", "price",
+    "percent_change_1h", "percent_change_24h", "percent_change_7d",
+    "percent_change_30d", "percent_change_60d", "percent_change_90d",
+    "volume_24h", "volume_change_24h",
+    "market_cap", "market_cap_dominance",
+    "volume_rank_top100", "loser_rank_top100", "gainer_rank_top100",
     "is_top100",
 ]
 
@@ -196,7 +171,7 @@ CSV_COLUMNS = [
 def get_api_key():
     api_key = os.getenv("CMC_API_KEY")
     if not api_key:
-        print("ERROR: No existe la variable de entorno CMC_API_KEY.")
+        print("ERROR: No existe CMC_API_KEY.")
         sys.exit(1)
     return api_key
 
@@ -210,49 +185,31 @@ def safe_float(value):
         return None
 
 
-def safe_int(value):
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def create_snapshot_id(timestamp):
     return timestamp.strftime("%Y%m%d_%H%M%S")
 
 
 # ============================================================
-# OBTENER TOP 100
+# FETCH
 # ============================================================
 
-def fetch_top_100(api_key):
-    headers = {
-        "Accepts": "application/json",
-        "X-CMC_PRO_API_KEY": api_key,
-    }
+def fetch_monedas(api_key):
+    headers = {"Accepts": "application/json", "X-CMC_PRO_API_KEY": api_key}
     params = {
-        "start": 1,
-        "limit": TOP_N,
-        "convert": "USD",
-        "sort": "market_cap",
-        "sort_dir": "desc",
+        "start": 1, "limit": TOP_N, "convert": "USD",
+        "sort": "market_cap", "sort_dir": "desc",
         "cryptocurrency_type": "all",
     }
-    print("Consultando CoinMarketCap...")
-    response = requests.get(CMC_API_URL, headers=headers, params=params, timeout=TIMEOUT)
-    print(f"HTTP: {response.status_code}")
-    if response.status_code != 200:
-        print("Respuesta de CoinMarketCap:")
-        print(response.text)
-        response.raise_for_status()
-    payload = response.json()
+    print(f"Consultando CoinMarketCap (limit={TOP_N})...")
+    r = requests.get(CMC_API_URL, headers=headers, params=params, timeout=TIMEOUT)
+    print(f"HTTP: {r.status_code}")
+    if r.status_code != 200:
+        print(r.text)
+        r.raise_for_status()
+    payload = r.json()
     status = payload.get("status", {})
-    error_code = status.get("error_code", 0)
-    if error_code != 0:
-        print("ERROR DE CMC:")
-        print(status)
+    if status.get("error_code", 0) != 0:
+        print("ERROR CMC:", status)
         sys.exit(1)
     data = payload.get("data", [])
     if not data:
@@ -264,40 +221,45 @@ def fetch_top_100(api_key):
 
 
 # ============================================================
-# CALCULAR RANKINGS
+# RANKINGS (solo top 100)
 # ============================================================
 
 def calculate_rankings(coins):
-    def change_24h(coin):
-        quote = coin.get("quote", {}).get("USD", {})
-        return safe_float(quote.get("percent_change_24h"))
+    def ch(c):
+        q = c.get("quote", {}).get("USD", {})
+        return safe_float(q.get("percent_change_24h"))
 
-    def volume_24h(coin):
-        quote = coin.get("quote", {}).get("USD", {})
-        return safe_float(quote.get("volume_24h"))
+    def vol(c):
+        q = c.get("quote", {}).get("USD", {})
+        return safe_float(q.get("volume_24h"))
 
-    losers = sorted(coins, key=lambda c: (change_24h(c) if change_24h(c) is not None else float("inf")))
-    gainers = sorted(coins, key=lambda c: (change_24h(c) if change_24h(c) is not None else float("-inf")), reverse=True)
-    volume = sorted(coins, key=lambda c: (volume_24h(c) if volume_24h(c) is not None else float("-inf")), reverse=True)
+    losers = sorted(coins, key=lambda c: (ch(c) if ch(c) is not None else float("inf")))
+    gainers = sorted(coins, key=lambda c: (ch(c) if ch(c) is not None else float("-inf")), reverse=True)
+    volume = sorted(coins, key=lambda c: (vol(c) if vol(c) is not None else float("-inf")), reverse=True)
 
-    loser_rank = {c["id"]: p for p, c in enumerate(losers, start=1)}
-    gainer_rank = {c["id"]: p for p, c in enumerate(gainers, start=1)}
-    volume_rank = {c["id"]: p for p, c in enumerate(volume, start=1)}
-
-    return loser_rank, gainer_rank, volume_rank
+    return (
+        {c["id"]: p for p, c in enumerate(losers, start=1)},
+        {c["id"]: p for p, c in enumerate(gainers, start=1)},
+        {c["id"]: p for p, c in enumerate(volume, start=1)},
+    )
 
 
 # ============================================================
 # CONSTRUIR REGISTROS
 # ============================================================
 
-def build_records(coins, timestamp):
+def build_records(coins, timestamp, es_top100=True):
     snapshot_id = create_snapshot_id(timestamp)
-    loser_rank, gainer_rank, volume_rank = calculate_rankings(coins)
+
+    if es_top100:
+        loser_rank, gainer_rank, volume_rank = calculate_rankings(coins)
+    else:
+        loser_rank, gainer_rank, volume_rank = {}, {}, {}
+
     records = []
     for coin in coins:
-        quote = coin.get("quote", {}).get("USD", {})
-        record = {
+        q = coin.get("quote", {}).get("USD", {})
+        records.append({
             "snapshot_id": snapshot_id,
             "timestamp": timestamp.isoformat(),
             "cmc_id": coin.get("id"),
@@ -305,81 +267,38 @@ def build_records(coins, timestamp):
             "symbol": coin.get("symbol"),
             "slug": coin.get("slug"),
             "cmc_rank": coin.get("cmc_rank"),
-            "price": safe_float(quote.get("price")),
-            "percent_change_1h": safe_float(quote.get("percent_change_1h")),
-            "percent_change_24h": safe_float(quote.get("percent_change_24h")),
-            "percent_change_7d": safe_float(quote.get("percent_change_7d")),
-            "percent_change_30d": safe_float(quote.get("percent_change_30d")),
-            "percent_change_60d": safe_float(quote.get("percent_change_60d")),
-            "percent_change_90d": safe_float(quote.get("percent_change_90d")),
-            "volume_24h": safe_float(quote.get("volume_24h")),
-            "volume_change_24h": safe_float(quote.get("volume_change_24h")),
-            "market_cap": safe_float(quote.get("market_cap")),
-            "market_cap_dominance": safe_float(quote.get("market_cap_dominance")),
+            "price": safe_float(q.get("price")),
+            "percent_change_1h": safe_float(q.get("percent_change_1h")),
+            "percent_change_24h": safe_float(q.get("percent_change_24h")),
+            "percent_change_7d": safe_float(q.get("percent_change_7d")),
+            "percent_change_30d": safe_float(q.get("percent_change_30d")),
+            "percent_change_60d": safe_float(q.get("percent_change_60d")),
+            "percent_change_90d": safe_float(q.get("percent_change_90d")),
+            "volume_24h": safe_float(q.get("volume_24h")),
+            "volume_change_24h": safe_float(q.get("volume_change_24h")),
+            "market_cap": safe_float(q.get("market_cap")),
+            "market_cap_dominance": safe_float(q.get("market_cap_dominance")),
             "volume_rank_top100": volume_rank.get(coin.get("id")),
             "loser_rank_top100": loser_rank.get(coin.get("id")),
             "gainer_rank_top100": gainer_rank.get(coin.get("id")),
-            "is_top100": 1,
-        }
-        records.append(record)
+            "is_top100": 1 if es_top100 else 0,
+        })
     return records
 
 
 # ============================================================
-# GUARDAR CSV
+# GUARDAR
 # ============================================================
 
-def save_records(records):
+def save_records(records, archivo):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    file_exists = CSV_FILE.exists()
-    with CSV_FILE.open("a", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=CSV_COLUMNS)
+    file_exists = archivo.exists()
+    with archivo.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         if not file_exists:
             writer.writeheader()
         writer.writerows(records)
-    print(f"Guardado: {len(records)} registros")
-    print(f"Archivo: {CSV_FILE}")
-
-
-# ============================================================
-# RESUMEN
-# ============================================================
-
-def print_summary(records):
-    print()
-    print("=" * 100)
-    print("RESUMEN DE CAPTURA CMC")
-    print("=" * 100)
-    print(f"Registros: {len(records)}")
-    if not records:
-        return
-    timestamp = records[0]["timestamp"]
-    print(f"Timestamp: {timestamp}")
-    print(f"Archivo:   {CSV_FILE}")
-
-    print()
-    print("TOP 10 MAYORES CAÍDAS 24H")
-    print("-" * 100)
-    losers = sorted(records, key=lambda x: (x["percent_change_24h"] if x["percent_change_24h"] is not None else float("inf")))
-    for position, coin in enumerate(losers[:10], start=1):
-        change = coin["percent_change_24h"]
-        print(f"{position:2d}. {coin['symbol']:<10} {change:8.2f}% CMC#{coin['cmc_rank']}")
-
-    print()
-    print("TOP 10 MAYORES SUBIDAS 24H")
-    print("-" * 100)
-    gainers = sorted(records, key=lambda x: (x["percent_change_24h"] if x["percent_change_24h"] is not None else float("-inf")), reverse=True)
-    for position, coin in enumerate(gainers[:10], start=1):
-        change = coin["percent_change_24h"]
-        print(f"{position:2d}. {coin['symbol']:<10} {change:8.2f}% CMC#{coin['cmc_rank']}")
-
-    print()
-    print("TOP 10 MAYOR VOLUMEN 24H")
-    print("-" * 100)
-    volume = sorted(records, key=lambda x: (x["volume_24h"] if x["volume_24h"] is not None else float("-inf")), reverse=True)
-    for position, coin in enumerate(volume[:10], start=1):
-        volume_value = coin["volume_24h"] or 0
-        print(f"{position:2d}. {coin['symbol']:<10} ${volume_value:,.0f} CMC#{coin['cmc_rank']}")
+    print(f"Guardado: {len(records)} registros en {archivo.name}")
 
 
 # ============================================================
@@ -389,16 +308,14 @@ def print_summary(records):
 def main():
     print()
     print("=" * 100)
-    print("CMC COLLECTOR")
+    print("CMC COLLECTOR — TOP 100 + EMERGING 101-200")
     print("=" * 100)
 
-    # 1) Inicializar rotación si es la primera vez
     inicializar_rotacion()
 
-    # 2) Comprobar si toca rotar
     if toca_rotar():
-        print(f"Han pasado {DIAS_ROTACION}+ días. Rotando CSV...")
-        info = rotar_csv()
+        print(f"Han pasado {DIAS_ROTACION}+ días. Rotando CSVs nuevos...")
+        info = rotar_ambos_csv()
         if info:
             notificar_rotacion(info)
     else:
@@ -407,17 +324,20 @@ def main():
             ahora = datetime.now(timezone.utc)
             if ultima.tzinfo is None:
                 ultima = ultima.replace(tzinfo=timezone.utc)
-            delta = ahora - ultima
-            dias_restantes = max(0, DIAS_ROTACION - delta.days)
+            dias_restantes = max(0, DIAS_ROTACION - (ahora - ultima).days)
             print(f"Próxima rotación en ~{dias_restantes} día(s)")
 
-    # 3) Capturar datos
     api_key = get_api_key()
     timestamp = datetime.now(timezone.utc)
-    coins = fetch_top_100(api_key)
-    records = build_records(coins, timestamp)
-    save_records(records)
-    print_summary(records)
+    coins = fetch_monedas(api_key)
+
+    top_100 = [c for c in coins if (c.get("cmc_rank") or 99999) <= 100]
+    emerging = [c for c in coins if 100 < (c.get("cmc_rank") or 99999) <= 200]
+
+    print(f"\nDividido: {len(top_100)} top100 | {len(emerging)} emerging")
+
+    save_records(build_records(top_100, timestamp, es_top100=True), CSV_FILE)
+    save_records(build_records(emerging, timestamp, es_top100=False), CSV_EMERGING)
 
     print()
     print("=" * 100)
