@@ -26,7 +26,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests
+          pip install requests pandas
 
       - name: Run CMC collector
         env:
@@ -40,6 +40,15 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Mantener solo el archive más reciente por tipo (top100 y emerging)
+          # El resto se borra para no acumular data en el repo
+          if [ -d data/cmc/archives ]; then
+            for tipo in top100 emerging; do
+              # Lista archivos ordenados por fecha (más reciente primero)
+              ls -t data/cmc/archives/${tipo}_*.csv 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
+            done
+          fi
 
           git add data/cmc/
 
