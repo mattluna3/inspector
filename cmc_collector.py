@@ -4,6 +4,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import pandas as pd
 import requests
 
 
@@ -22,6 +23,7 @@ ROTATION_FILE = DATA_DIR / "last_rotation.txt"
 ARCHIVE_DIR = DATA_DIR / "archives"
 
 DIAS_ROTACION = 5
+HORAS_RETENCION_CSV = 72   # conservar 72h en el CSV activo tras rotar
 
 GITHUB_USER = "mattluna3"
 GITHUB_REPO = "inspector"
@@ -87,7 +89,10 @@ def toca_rotar():
 
 
 def rotar_ambos_csv():
-    """Rota los 2 CSVs nuevos. NO toca market_history.csv viejo."""
+    """
+    Rota los 2 CSVs conservando 72h en el CSV activo.
+    El resto se mueve al archive (que se puede borrar tras descargar).
+    """
     if not CSV_FILE.exists() and not CSV_EMERGING.exists():
         print("No hay CSVs nuevos para rotar.")
         return None
@@ -98,21 +103,51 @@ def rotar_ambos_csv():
 
     info = {"fecha": ahora, "archivos": [], "tamaño_total_mb": 0}
 
-    if CSV_FILE.exists():
-        destino = ARCHIVE_DIR / f"top100_{sufijo}.csv"
-        CSV_FILE.rename(destino)
-        t = destino.stat().st_size / (1024 * 1024)
-        info["archivos"].append({"nombre": destino.name, "tipo": "top100", "tamaño_mb": t})
-        info["tamaño_total_mb"] += t
-        print(f"Rotado top100: {destino.name} ({t:.2f} MB)")
+    for csv_path, tipo in [(CSV_FILE, "top100"), (CSV_EMERGING, "emerging")]:
+        if not csv_path.exists():
+            continue
 
-    if CSV_EMERGING.exists():
-        destino = ARCHIVE_DIR / f"emerging_{sufijo}.csv"
-        CSV_EMERGING.rename(destino)
-        t = destino.stat().st_size / (1024 * 1024)
-        info["archivos"].append({"nombre": destino.name, "tipo": "emerging", "tamaño_mb": t})
-        info["tamaño_total_mb"] += t
-        print(f"Rotado emerging: {destino.name} ({t:.2f} MB)")
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            print(f"Error leyendo {csv_path.name}: {e}")
+            continue
+
+        if len(df) == 0:
+            print(f"{csv_path.name} vacío, se omite")
+            continue
+
+        # Normalizar timestamp
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        df = df.sort_values("timestamp")
+
+        # Corte: últimas N horas
+        ts_max = df["timestamp"].max()
+        corte = ts_max - timedelta(hours=HORAS_RETENCION_CSV)
+
+        df_reciente = df[df["timestamp"] >= corte].copy()
+        df_viejo = df[df["timestamp"] < corte].copy()
+
+        # Archive: solo lo viejo
+        if len(df_viejo) > 0:
+            archivo = ARCHIVE_DIR / f"{tipo}_{sufijo}.csv"
+            df_viejo.to_csv(archivo, index=False)
+            t = archivo.stat().st_size / (1024 * 1024)
+            info["archivos"].append({
+                "nombre": archivo.name,
+                "tipo": tipo,
+                "tamaño_mb": t,
+            })
+            info["tamaño_total_mb"] += t
+            print(f"Archivado {tipo}: {len(df_viejo):,} filas ({t:.2f} MB)")
+        else:
+            print(f"{tipo}: nada que archivar (todo dentro de {HORAS_RETENCION_CSV}h)")
+
+        # Reescribir CSV activo con solo las últimas N horas
+        df_reciente.to_csv(csv_path, index=False)
+        print(f"CSV {tipo} conserva {len(df_reciente):,} filas "
+              f"(desde {df_reciente['timestamp'].min()} hasta {ts_max})")
 
     guardar_ultima_rotacion(ahora)
     return info
@@ -129,7 +164,10 @@ def notificar_rotacion(info):
             f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/"
             f"{GITHUB_BRANCH}/data/cmc/archives/{a['nombre']}"
         )
-        lineas.append(f"📄 {a['tipo'].upper()} ({a['tamaño_mb']:.1f} MB)\n{a['nombre']}\n{url_raw}")
+        lineas.append(
+            f"📄 {a['tipo'].upper()} ({a['tamaño_mb']:.1f} MB)\n"
+            f"{a['nombre']}\n{url_raw}"
+        )
 
     msg = (
         f"📦 CMC CACHE LISTO PARA DESCARGAR\n"
@@ -234,8 +272,16 @@ def calculate_rankings(coins):
         return safe_float(q.get("volume_24h"))
 
     losers = sorted(coins, key=lambda c: (ch(c) if ch(c) is not None else float("inf")))
-    gainers = sorted(coins, key=lambda c: (ch(c) if ch(c) is not None else float("-inf")), reverse=True)
-    volume = sorted(coins, key=lambda c: (vol(c) if vol(c) is not None else float("-inf")), reverse=True)
+    gainers = sorted(
+        coins,
+        key=lambda c: (ch(c) if ch(c) is not None else float("-inf")),
+        reverse=True,
+    )
+    volume = sorted(
+        coins,
+        key=lambda c: (vol(c) if vol(c) is not None else float("-inf")),
+        reverse=True,
+    )
 
     return (
         {c["id"]: p for p, c in enumerate(losers, start=1)},
