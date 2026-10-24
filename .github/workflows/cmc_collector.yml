@@ -41,12 +41,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          if [ -d data/cmc/archives ]; then
-            for tipo in top100 emerging; do
-              ls -t data/cmc/archives/${tipo}_*.csv 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
-            done
-          fi
-
           git add data/cmc/
 
           if git diff --cached --quiet; then
