@@ -1,7 +1,7 @@
 import csv
 import os
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -17,17 +17,11 @@ CMC_API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/late
 TOP_N = 200   # 1 sola llamada, 1 crédito
 
 DATA_DIR = Path("data") / "cmc"
-CSV_FILE = DATA_DIR / "market_history_top100.csv"       # top 1-100
-CSV_EMERGING = DATA_DIR / "market_history_emerging.csv" # top 101-200
-ROTATION_FILE = DATA_DIR / "last_rotation.txt"
-ARCHIVE_DIR = DATA_DIR / "archives"
 
-DIAS_ROTACION = 5
-HORAS_RETENCION_CSV = 72   # conservar 72h en el CSV activo tras rotar
-
-GITHUB_USER = "mattluna3"
-GITHUB_REPO = "inspector"
-GITHUB_BRANCH = "main"
+# Archivos del día actual (se crea uno nuevo cada día)
+HOY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+CSV_TOP100 = DATA_DIR / f"market_history_top100_{HOY}.csv"
+CSV_EMERGING = DATA_DIR / f"market_history_emerging_{HOY}.csv"
 
 TIMEOUT = 30
 
@@ -50,139 +44,6 @@ def enviar_telegram(msg):
     except Exception as e:
         print(f"Error Telegram: {e}")
         return False
-
-
-# ============================================================
-# ROTACIÓN
-# ============================================================
-
-def leer_ultima_rotacion():
-    if not ROTATION_FILE.exists():
-        return None
-    try:
-        return datetime.fromisoformat(ROTATION_FILE.read_text().strip())
-    except Exception:
-        return None
-
-
-def guardar_ultima_rotacion(dt):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    ROTATION_FILE.write_text(dt.isoformat())
-
-
-def inicializar_rotacion():
-    if not ROTATION_FILE.exists():
-        guardar_ultima_rotacion(datetime.now(timezone.utc))
-        print(f"Primera ejecución: próxima rotación en {DIAS_ROTACION} días")
-        return True
-    return False
-
-
-def toca_rotar():
-    ultima = leer_ultima_rotacion()
-    if ultima is None:
-        return False
-    ahora = datetime.now(timezone.utc)
-    if ultima.tzinfo is None:
-        ultima = ultima.replace(tzinfo=timezone.utc)
-    return (ahora - ultima) >= timedelta(days=DIAS_ROTACION)
-
-
-def rotar_ambos_csv():
-    """
-    Rota los 2 CSVs conservando 72h en el CSV activo.
-    El resto se mueve al archive (que se puede borrar tras descargar).
-    """
-    if not CSV_FILE.exists() and not CSV_EMERGING.exists():
-        print("No hay CSVs nuevos para rotar.")
-        return None
-
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    ahora = datetime.now(timezone.utc)
-    sufijo = ahora.strftime("%Y%m%d_%H%M")
-
-    info = {"fecha": ahora, "archivos": [], "tamaño_total_mb": 0}
-
-    for csv_path, tipo in [(CSV_FILE, "top100"), (CSV_EMERGING, "emerging")]:
-        if not csv_path.exists():
-            continue
-
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception as e:
-            print(f"Error leyendo {csv_path.name}: {e}")
-            continue
-
-        if len(df) == 0:
-            print(f"{csv_path.name} vacío, se omite")
-            continue
-
-        # Normalizar timestamp
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        df = df.dropna(subset=["timestamp"])
-        df = df.sort_values("timestamp")
-
-        # Corte: últimas N horas
-        ts_max = df["timestamp"].max()
-        corte = ts_max - timedelta(hours=HORAS_RETENCION_CSV)
-
-        df_reciente = df[df["timestamp"] >= corte].copy()
-        df_viejo = df[df["timestamp"] < corte].copy()
-
-        # Archive: solo lo viejo
-        if len(df_viejo) > 0:
-            archivo = ARCHIVE_DIR / f"{tipo}_{sufijo}.csv"
-            df_viejo.to_csv(archivo, index=False)
-            t = archivo.stat().st_size / (1024 * 1024)
-            info["archivos"].append({
-                "nombre": archivo.name,
-                "tipo": tipo,
-                "tamaño_mb": t,
-            })
-            info["tamaño_total_mb"] += t
-            print(f"Archivado {tipo}: {len(df_viejo):,} filas ({t:.2f} MB)")
-        else:
-            print(f"{tipo}: nada que archivar (todo dentro de {HORAS_RETENCION_CSV}h)")
-
-        # Reescribir CSV activo con solo las últimas N horas
-        df_reciente.to_csv(csv_path, index=False)
-        print(f"CSV {tipo} conserva {len(df_reciente):,} filas "
-              f"(desde {df_reciente['timestamp'].min()} hasta {ts_max})")
-
-    guardar_ultima_rotacion(ahora)
-    return info
-
-
-def notificar_rotacion(info):
-    if not info:
-        return
-
-    fecha_lima = info["fecha"] - timedelta(hours=5)
-    lineas = []
-    for a in info["archivos"]:
-        url_raw = (
-            f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/"
-            f"{GITHUB_BRANCH}/data/cmc/archives/{a['nombre']}"
-        )
-        lineas.append(
-            f"📄 {a['tipo'].upper()} ({a['tamaño_mb']:.1f} MB)\n"
-            f"{a['nombre']}\n{url_raw}"
-        )
-
-    msg = (
-        f"📦 CMC CACHE LISTO PARA DESCARGAR\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 Cierre: {fecha_lima.strftime('%Y-%m-%d %H:%M')} Lima\n"
-        f"💾 Total: {info['tamaño_total_mb']:.2f} MB\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        + "\n\n".join(lineas) +
-        f"\n━━━━━━━━━━━━━━━━━━━"
-    )
-
-    if enviar_telegram(msg):
-        print("Telegram enviado: notificación de rotación")
-    else:
-        print("Fallo al enviar Telegram")
 
 
 # ============================================================
@@ -333,18 +194,20 @@ def build_records(coins, timestamp, es_top100=True):
 
 
 # ============================================================
-# GUARDAR
+# GUARDAR (append al archivo del día)
 # ============================================================
 
 def save_records(records, archivo):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     file_exists = archivo.exists()
+
     with archivo.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         if not file_exists:
             writer.writeheader()
         writer.writerows(records)
-    print(f"Guardado: {len(records)} registros en {archivo.name}")
+
+    print(f"Guardado: {len(records)} registros → {archivo.name}")
 
 
 # ============================================================
@@ -352,26 +215,10 @@ def save_records(records, archivo):
 # ============================================================
 
 def main():
-    print()
+    print("\n" + "=" * 100)
+    print("📊 CMC COLLECTOR — TOP 100 + EMERGING 101-200 (v3: archivos diarios)")
+    print(f"Archivo del día: {CSV_TOP100.name} y {CSV_EMERGING.name}")
     print("=" * 100)
-    print("CMC COLLECTOR — TOP 100 + EMERGING 101-200")
-    print("=" * 100)
-
-    inicializar_rotacion()
-
-    if toca_rotar():
-        print(f"Han pasado {DIAS_ROTACION}+ días. Rotando CSVs nuevos...")
-        info = rotar_ambos_csv()
-        if info:
-            notificar_rotacion(info)
-    else:
-        ultima = leer_ultima_rotacion()
-        if ultima:
-            ahora = datetime.now(timezone.utc)
-            if ultima.tzinfo is None:
-                ultima = ultima.replace(tzinfo=timezone.utc)
-            dias_restantes = max(0, DIAS_ROTACION - (ahora - ultima).days)
-            print(f"Próxima rotación en ~{dias_restantes} día(s)")
 
     api_key = get_api_key()
     timestamp = datetime.now(timezone.utc)
@@ -382,12 +229,12 @@ def main():
 
     print(f"\nDividido: {len(top_100)} top100 | {len(emerging)} emerging")
 
-    save_records(build_records(top_100, timestamp, es_top100=True), CSV_FILE)
+    save_records(build_records(top_100, timestamp, es_top100=True), CSV_TOP100)
     save_records(build_records(emerging, timestamp, es_top100=False), CSV_EMERGING)
 
     print()
     print("=" * 100)
-    print("CAPTURA FINALIZADA")
+    print("✅ CAPTURA FINALIZADA")
     print("=" * 100)
 
 
