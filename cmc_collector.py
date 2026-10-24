@@ -1,7 +1,7 @@
 import csv
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -14,14 +14,13 @@ import requests
 
 CMC_API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
 
-TOP_N = 200   # 1 sola llamada, 1 crédito
+TOP_N = 200
 
 DATA_DIR = Path("data") / "cmc"
+CSV_FILE = DATA_DIR / "market_history_top100.csv"       # top 1-100 (activo)
+CSV_EMERGING = DATA_DIR / "market_history_emerging.csv" # top 101-200 (activo)
 
-# Archivos del día actual (se crea uno nuevo cada día)
-HOY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-CSV_TOP100 = DATA_DIR / f"market_history_top100_{HOY}.csv"
-CSV_EMERGING = DATA_DIR / f"market_history_emerging_{HOY}.csv"
+DIAS_VENTANA = 4  # hoy + 3 anteriores
 
 TIMEOUT = 30
 
@@ -194,7 +193,7 @@ def build_records(coins, timestamp, es_top100=True):
 
 
 # ============================================================
-# GUARDAR (append al archivo del día)
+# GUARDAR (append al archivo activo)
 # ============================================================
 
 def save_records(records, archivo):
@@ -211,13 +210,52 @@ def save_records(records, archivo):
 
 
 # ============================================================
+# ROTACIÓN INTELIGENTE
+# ============================================================
+
+def rotar_archivo_activo(csv_path, tipo):
+    if not csv_path.exists():
+        return
+    
+    print(f"  🔄 Rotando {csv_path.name}...")
+    
+    try:
+        df = pd.read_csv(csv_path, low_memory=False)
+    except Exception as e:
+        print(f"  ⚠️ Error leyendo {csv_path.name}: {e}")
+        return
+    
+    if len(df) == 0:
+        return
+    
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce", format="mixed")
+    df = df.dropna(subset=["timestamp"])
+    df = df.sort_values("timestamp")
+    
+    hoy = datetime.now(timezone.utc).date()
+    fecha_corte = hoy - timedelta(days=DIAS_VENTANA - 1)
+    
+    df_viejos = df[df["timestamp"].dt.date < fecha_corte]
+    df_recientes = df[df["timestamp"].dt.date >= fecha_corte]
+    
+    if len(df_viejos) > 0:
+        for fecha, grupo in df_viejos.groupby(df_viejos["timestamp"].dt.date):
+            archivo_diario = DATA_DIR / f"market_history_{tipo}_{fecha.isoformat()}.csv"
+            grupo.to_csv(archivo_diario, index=False)
+            print(f"  📁 Día {fecha} extraído → {archivo_diario.name} ({len(grupo):,} filas)")
+    
+    df_recientes.to_csv(csv_path, index=False)
+    print(f"  ✅ {csv_path.name} conserva {len(df_recientes):,} filas "
+          f"(desde {df_recientes['timestamp'].min()} hasta {df_recientes['timestamp'].max()})")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 def main():
     print("\n" + "=" * 100)
-    print("📊 CMC COLLECTOR — TOP 100 + EMERGING 101-200 (v3: archivos diarios)")
-    print(f"Archivo del día: {CSV_TOP100.name} y {CSV_EMERGING.name}")
+    print("📊 CMC COLLECTOR — TOP 100 + EMERGING 101-200 (v4: híbrido 4 días)")
     print("=" * 100)
 
     api_key = get_api_key()
@@ -229,8 +267,14 @@ def main():
 
     print(f"\nDividido: {len(top_100)} top100 | {len(emerging)} emerging")
 
-    save_records(build_records(top_100, timestamp, es_top100=True), CSV_TOP100)
+    # 1. Guardar en el archivo activo
+    save_records(build_records(top_100, timestamp, es_top100=True), CSV_FILE)
     save_records(build_records(emerging, timestamp, es_top100=False), CSV_EMERGING)
+
+    # 2. Rotar: extraer los días más viejos
+    print("\n📦 Rotación de archivos activos...")
+    rotar_archivo_activo(CSV_FILE, "top100")
+    rotar_archivo_activo(CSV_EMERGING, "emerging")
 
     print()
     print("=" * 100)
