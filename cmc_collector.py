@@ -19,8 +19,10 @@ TOP_N = 200
 DATA_DIR = Path("data") / "cmc"
 CSV_FILE = DATA_DIR / "market_history_top100.csv"       # top 1-100 (activo)
 CSV_EMERGING = DATA_DIR / "market_history_emerging.csv" # top 101-200 (activo)
+RADAR_HISTORY_FILE = DATA_DIR / "radar_history.csv"      # historia del radar
 
-DIAS_VENTANA = 4  # hoy + 3 anteriores
+DIAS_VENTANA = 4      # hoy + 3 anteriores (para consolidados)
+DIAS_RADAR = 15       # 15 días para el radar_history
 
 TIMEOUT = 30
 
@@ -210,43 +212,118 @@ def save_records(records, archivo):
 
 
 # ============================================================
-# ROTACIÓN INTELIGENTE
+# ROTACIÓN INTELIGENTE (consolidados)
 # ============================================================
 
 def rotar_archivo_activo(csv_path, tipo):
     if not csv_path.exists():
         return
-    
+
     print(f"  🔄 Rotando {csv_path.name}...")
-    
+
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except Exception as e:
         print(f"  ⚠️ Error leyendo {csv_path.name}: {e}")
         return
-    
+
     if len(df) == 0:
         return
-    
+
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce", format="mixed")
     df = df.dropna(subset=["timestamp"])
     df = df.sort_values("timestamp")
-    
+
     hoy = datetime.now(timezone.utc).date()
     fecha_corte = hoy - timedelta(days=DIAS_VENTANA - 1)
-    
+
     df_viejos = df[df["timestamp"].dt.date < fecha_corte]
     df_recientes = df[df["timestamp"].dt.date >= fecha_corte]
-    
+
     if len(df_viejos) > 0:
         for fecha, grupo in df_viejos.groupby(df_viejos["timestamp"].dt.date):
             archivo_diario = DATA_DIR / f"market_history_{tipo}_{fecha.isoformat()}.csv"
             grupo.to_csv(archivo_diario, index=False)
             print(f"  📁 Día {fecha} extraído → {archivo_diario.name} ({len(grupo):,} filas)")
-    
+
     df_recientes.to_csv(csv_path, index=False)
     print(f"  ✅ {csv_path.name} conserva {len(df_recientes):,} filas "
           f"(desde {df_recientes['timestamp'].min()} hasta {df_recientes['timestamp'].max()})")
+
+
+# ============================================================
+# ACTUALIZAR RADAR_HISTORY
+# ============================================================
+
+def actualizar_radar_history():
+    """
+    Actualiza el archivo radar_history.csv con datos frescos.
+    Solo guarda las monedas del radar (leídas desde RADAR_CONFIG)
+    y mantiene los últimos 15 días.
+    """
+    import json
+
+    radar_config_raw = os.getenv("RADAR_CONFIG")
+    if not radar_config_raw:
+        print("   ⚠️ RADAR_CONFIG no encontrado. Saltando actualización del radar.")
+        return
+
+    try:
+        radar_config = json.loads(radar_config_raw)
+    except Exception as e:
+        print(f"   ⚠️ Error al leer RADAR_CONFIG: {e}")
+        return
+
+    monedas_radar = set()
+    for key in ["radar_suelos", "radar_techos", "radar_fuerza"]:
+        if key in radar_config:
+            monedas_radar.update(radar_config[key].keys())
+
+    if not monedas_radar:
+        print("   ⚠️ No hay monedas en RADAR_CONFIG. Saltando actualización.")
+        return
+
+    print(f"   📊 Actualizando radar_history.csv ({len(monedas_radar)} monedas)...")
+
+    dfs = []
+
+    if RADAR_HISTORY_FILE.exists():
+        try:
+            df_viejo = pd.read_csv(RADAR_HISTORY_FILE, low_memory=False)
+            dfs.append(df_viejo)
+            print(f"   ✅ Archivo existente: {len(df_viejo):,} filas")
+        except Exception as e:
+            print(f"   ⚠️ Error leyendo radar_history.csv: {e}")
+
+    for nombre, archivo in [("top100", CSV_FILE), ("emerging", CSV_EMERGING)]:
+        if archivo.exists():
+            try:
+                df = pd.read_csv(archivo, low_memory=False)
+                df = df[df["symbol"].str.upper().isin(monedas_radar)]
+                if len(df) > 0:
+                    dfs.append(df)
+                    print(f"   ✅ {nombre}: {len(df):,} filas del radar")
+            except Exception as e:
+                print(f"   ⚠️ Error leyendo {nombre}: {e}")
+
+    if not dfs:
+        print("   ❌ No hay datos para actualizar.")
+        return
+
+    df_total = pd.concat(dfs, ignore_index=True)
+    df_total["timestamp"] = pd.to_datetime(df_total["timestamp"], utc=True, errors="coerce", format="mixed")
+    df_total = df_total.dropna(subset=["timestamp"])
+    df_total = df_total.drop_duplicates(subset=["timestamp", "symbol"], keep="last")
+
+    fecha_corte = datetime.now(timezone.utc) - timedelta(days=DIAS_RADAR)
+    df_total = df_total[df_total["timestamp"] >= fecha_corte]
+
+    df_total = df_total.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+    df_total.to_csv(RADAR_HISTORY_FILE, index=False)
+
+    print(f"   ✅ radar_history.csv actualizado: {len(df_total):,} filas")
+    print(f"   📅 Rango: {df_total['timestamp'].min()} → {df_total['timestamp'].max()}")
+    print(f"   📊 Monedas: {df_total['symbol'].nunique()}")
 
 
 # ============================================================
@@ -271,7 +348,11 @@ def main():
     save_records(build_records(top_100, timestamp, es_top100=True), CSV_FILE)
     save_records(build_records(emerging, timestamp, es_top100=False), CSV_EMERGING)
 
-    # 2. Rotar: extraer los días más viejos
+    # 2. Actualizar radar_history.csv
+    print("\n📦 Actualizando radar_history.csv...")
+    actualizar_radar_history()
+
+    # 3. Rotar: extraer los días más viejos
     print("\n📦 Rotación de archivos activos...")
     rotar_archivo_activo(CSV_FILE, "top100")
     rotar_archivo_activo(CSV_EMERGING, "emerging")
