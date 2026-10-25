@@ -262,6 +262,7 @@ def actualizar_radar_history():
     y mantiene los últimos 15 días.
     """
     import json
+    from io import StringIO
 
     radar_config_raw = os.getenv("RADAR_CONFIG")
     if not radar_config_raw:
@@ -287,6 +288,7 @@ def actualizar_radar_history():
 
     dfs = []
 
+    # 1. Leer archivo existente
     if RADAR_HISTORY_FILE.exists():
         try:
             df_viejo = pd.read_csv(RADAR_HISTORY_FILE, low_memory=False)
@@ -295,6 +297,7 @@ def actualizar_radar_history():
         except Exception as e:
             print(f"   ⚠️ Error leyendo radar_history.csv: {e}")
 
+    # 2. Leer consolidados locales (top100, emerging)
     for nombre, archivo in [("top100", CSV_FILE), ("emerging", CSV_EMERGING)]:
         if archivo.exists():
             try:
@@ -306,18 +309,36 @@ def actualizar_radar_history():
             except Exception as e:
                 print(f"   ⚠️ Error leyendo {nombre}: {e}")
 
+    # 3. Leer consolidado de 201_300 desde GitHub
+    try:
+        url_201_300 = "https://raw.githubusercontent.com/emerging2/inspector2/main/data/cmc/market_history_201_300.csv"
+        r = requests.get(url_201_300, timeout=60)
+        if r.status_code == 200:
+            df_201_300 = pd.read_csv(StringIO(r.text), low_memory=False)
+            df_201_300 = df_201_300[df_201_300["symbol"].str.upper().isin(monedas_radar)]
+            if len(df_201_300) > 0:
+                dfs.append(df_201_300)
+                print(f"   ✅ 201_300: {len(df_201_300):,} filas del radar")
+        else:
+            print(f"   ⚠️ 201_300: HTTP {r.status_code}")
+    except Exception as e:
+        print(f"   ⚠️ Error leyendo 201_300: {str(e)[:80]}")
+
     if not dfs:
         print("   ❌ No hay datos para actualizar.")
         return
 
+    # 4. Unir todos los datos
     df_total = pd.concat(dfs, ignore_index=True)
     df_total["timestamp"] = pd.to_datetime(df_total["timestamp"], utc=True, errors="coerce", format="mixed")
     df_total = df_total.dropna(subset=["timestamp"])
     df_total = df_total.drop_duplicates(subset=["timestamp", "symbol"], keep="last")
 
+    # 5. Filtrar los últimos DIAS_RADAR días
     fecha_corte = datetime.now(timezone.utc) - timedelta(days=DIAS_RADAR)
     df_total = df_total[df_total["timestamp"] >= fecha_corte]
 
+    # 6. Ordenar y guardar
     df_total = df_total.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
     df_total.to_csv(RADAR_HISTORY_FILE, index=False)
 
